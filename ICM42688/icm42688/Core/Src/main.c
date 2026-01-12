@@ -17,6 +17,7 @@
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
+#include <mahony_ahrs.h>
 #include "main.h"
 #include "adc.h"
 #include "rtc.h"
@@ -32,7 +33,6 @@
 #include <string.h>
 #include <stdbool.h>
 #include <math.h>
-#include <mahony_ahrs.h>
 
 
 #define CS_PIN GPIO_PIN_4
@@ -41,7 +41,10 @@
 #define REG_BANK_SEL  0x76
 #define UB0_REG_DEVICE_CONFIG  0x11
 #define UB0_REG_PWR_MGMT0 0x4E
-#define UB0_REG_TEMP_DATA1 0x1D
+//#define UB0_REG_TEMP_DATA1 0x1D
+#define FIFO_DATA 0X30
+#define FIFO_CONFIG1 0x5F
+#define INTF_CONFIG0 0x4C
 
 #define SAMPLE_PERIOD 0.0001
 
@@ -52,8 +55,9 @@ int setBank(uint8_t bank);
 void setLowNoiseMode();
 void reset();
 uint8_t whoAmI();
-void AGT(uint8_t *dataBuffer);
-void setAccelFS(uint8_t fssel);
+uint16_t AGT(uint8_t *dataBuffer);
+void setAccelFS();
+void configureFIFO();
 
 /* USER CODE END Includes */
 
@@ -103,10 +107,18 @@ int begin(){
 	reset();
 	uint8_t address = whoAmI();
 	setLowNoiseMode();
-	setAccelFS(0b01101001);
+
+	setAccelFS();
 	configureNotchFilter();
+
+	// sets filter for both gyro and accel
 	setAntiAliasFilter(213, true, true);
+
+	// finds zero rate offset bias
 	calibrateGyro();
+
+	//start FIFO
+	configureFIFO();
 	return address;
 }
 
@@ -133,57 +145,95 @@ uint8_t whoAmI(){
 	return buffer;
 }
 
-void AGT(uint8_t *dataBuffer){
-	readRegisters(UB0_REG_TEMP_DATA1, 14, dataBuffer);
+// Picks up the data from the FIFO_DATA register and puts it into a buffer.
+// returns number of bytes that can be read (note: each sample has 20 bytes)
+uint16_t AGT(uint8_t *dataBuffer){
+	// Indicates how many bytes available to read. size 2 to pick up high and low bits.
+	uint8_t fifo_num_bytes[2];
+	readRegisters(0x2E, 2, fifo_num_bytes);
+	uint16_t fifo_count = ((uint16_t)fifo_num_bytes[0] << 8) | fifo_num_bytes[1];
+	readRegisters(FIFO_DATA, fifo_count, dataBuffer);
+	return fifo_count;
 }
 
 
-float _gyroScale = 0;
+
+float _gyroScale = 1.0f/131.0f;
 uint8_t current_fssel = 0;
 uint8_t _gyroFS = 0;
 float _gyroBD[3] = {0, 0, 0};
 float _gyrB[3] = {0, 0, 0};
 float _gyr[3] = {0, 0, 0};
-uint8_t gyroBuffer[14];
-int16_t rawMeasGyro[7];
+uint8_t gyroBuffer[2040];
+int16_t rawMeasGyro[4];
 
-void setGyroFS(uint8_t fssel){
+
+void setGyroFS(){
 
 	setBank(0);
-	uint8_t reg;
-	readRegisters(0x4F, 1, &reg);
-	reg = (fssel << 5) | (reg & 0x1F);
-	writeRegister(0x4F, reg);
-	_gyroScale = (2000.0f / (float)(1 << fssel)) / 32768.0f;
-	_gyroFS = fssel;
+	// not needed, set default by fifo:
+	//uint8_t reg;
+	//readRegisters(0x4F, 1, &reg);
+	//reg = (fssel << 5) | (reg & 0x1F);
+
+	//instead:
+	writeRegister(0x4F, 0x07); //sets ODR to 200hz, sets dps to 2000 (Default for fifo)
+	_gyroScale = 1.0f / 131.0f;
+	//_gyroFS = fssel;
 }
 
 void calibrateGyro(){
-	const uint8_t current_fssel = _gyroFS;
-	setGyroFS(0x03);
+	//const uint8_t current_fssel = _gyroFS;
+	//setGyroFS(0x03);
+	setGyroFS();
 	_gyroBD[0] = 0;
 	_gyroBD[1] = 0;
 	_gyroBD[2] = 0;
 	for (size_t i=0; i < 1000; i++) {
-		AGT(gyroBuffer);
-		for (size_t i=0; i<7; i++) {
-			rawMeasGyro[i] = ((int16_t)gyroBuffer[i*2] << 8) | gyroBuffer[i*2+1];
-		}
-		for (size_t i=0; i<3; i++) {
-			_gyr[i] = (float)rawMeasGyro[i+4] / 16.4;
-		}
-		_gyroBD[0] += (_gyr[0] + _gyrB[0]) / 1000;
-		_gyroBD[1] += (_gyr[1] + _gyrB[1]) / 1000;
-		_gyroBD[2] += (_gyr[2] + _gyrB[2]) / 1000;
-		HAL_Delay(1);
+
+		uint16_t num_of_bytes = AGT(gyroBuffer);
+			  	  uint16_t num_samples = num_of_bytes/20; // 20 bytes in a sample
+
+			  	  for (size_t j = 0; j < num_samples; j++){
+
+			  		  uint8_t *samplePtr = &gyroBuffer[i * 20];
+
+			  		 // --- Gyro ---
+			  		 rawMeasGyro[0] = ((int32_t)samplePtr[0x07] << 12) | ((int32_t)samplePtr[0x08] << 4) | ((int32_t)samplePtr[0x11] & 0x0F) >> 1;
+			  		 rawMeasGyro[1] = ((int32_t)samplePtr[0x09] << 12) | ((int32_t)samplePtr[0x0A] << 4) | ((int32_t)samplePtr[0x12] & 0x0F) >> 1;
+			  		 rawMeasGyro[2] = ((int32_t)samplePtr[0x0B] << 12) | ((int32_t)samplePtr[0x0C] << 4) | ((int32_t)samplePtr[0x13] & 0x0F) >> 1;
+
+			  		 	 for (size_t k=0; k<3; k++) {
+			  		 		 _gyr[j] = (float)rawMeasGyro[j] / 16.4;
+			  		 	 }
+
+			  			_gyroBD[0] += (_gyr[0] + _gyrB[0]) / 1000;
+			  			_gyroBD[1] += (_gyr[1] + _gyrB[1]) / 1000;
+			  			_gyroBD[2] += (_gyr[2] + _gyrB[2]) / 1000;
+			  			HAL_Delay(1);
+			  	  }
+
 	}
 	_gyrB[0] = _gyroBD[0];
 	_gyrB[1] = _gyroBD[1];
 	_gyrB[2] = _gyroBD[2];
-	setGyroFS(current_fssel);
+	//setGyroFS(current_fssel);
 }
-uint8_t _accelFS = 0;
-float _accelScale = 0.0;
+
+// configure the FIFO
+void configureFIFO(){
+
+	writeRegister(0x16, 0xC0); // 0b11000000 stop on full to fifo
+
+	writeRegister(FIFO_CONFIG1, 0x57);
+
+	writeRegister(INTF_CONFIG0, 0xB0);
+
+}
+
+
+//uint8_t _accelFS = 0;
+float _accelScale = 1.0f/8192.0f;
 float _accBD[3] = {};
 uint8_t accelBuffer[14];
 float _acc[3] = {};
@@ -194,14 +244,17 @@ float _accMax[3] = {};
 float _accMin[3] = {};
 
 
-void setAccelFS(uint8_t fssel){
+void setAccelFS(){
 	setBank(0);
-	uint8_t reg;
-	readRegisters(0x50, 1, &reg);
-	reg = (fssel << 5) | (reg & 0x1F);
-	writeRegister(0x50, reg);
-	_accelScale = (float)(1 << (4 - fssel)) / 32768.0f;
-	_accelFS = fssel;
+	//not needed for fifo, default set
+	//uint8_t reg;
+	//readRegisters(0x50, 1, &reg);
+	//reg = (fssel << 5) | (reg & 0x1F);
+
+	writeRegister(0x50, 0x07); // 200hz ODR and default g
+
+	//_accelScale = (float)(1 << (4 - fssel)) / 32768.0f;
+	//_accelFS = fssel;
 }
 
 void configureNotchFilter(){
@@ -438,7 +491,7 @@ float lowPassFilter(float raw_value, int select) {
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-  uint8_t myBuffer[14];
+  uint8_t myBuffer[2040];
   int16_t rawMeas[7];
   double accel[4]; // x,y,z,magnitude
   double gyro[3];
@@ -719,20 +772,53 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  AGT(myBuffer);
-	  for (size_t i=0; i<7; i++) {
-	      rawMeas[i] = ((int16_t)myBuffer[i*2] << 8) | myBuffer[i*2+1];
-	   }
-	  int16_t temperature = rawMeas[0] / 132.48f + 25;
-	  for (size_t i=0; i<3; i++) {
-		  accel[i] = (float)rawMeas[i+1] / 2048.0 * 9.81 / 2.0;
-	  }
+	  // POST FIFO *********************
 
-	  accel[3] = pow(((accel[0]*accel[0]) + (accel[1]*accel[1]) + (accel[2]*accel[2])), 0.5);
+	  	  // num of bytes available to read
+	  	  uint16_t num_of_bytes = AGT(myBuffer);
+	  	  uint16_t num_samples = num_of_bytes/20; // 20 bytes in a sample
 
-	  for (size_t i=0; i<3; i++) {
-		  gyro[i] = lowPassFilter((float)rawMeas[i+4] / 16.4, i);
-	  }
+	  	  for (size_t i = 0; i < num_samples; i++){
+
+	  		  // makes it so every loop it extracts the most next sample received
+	  		  uint8_t *samplePtr = &myBuffer[i * 20];
+// adding a bit shift of 2 and 1 respectively)
+	  		          // --- Accel (x y z) ---
+	  		  	  	  int32_t accel_x = ((int32_t)samplePtr[0x01] << 12) | ((int32_t)samplePtr[0x02] << 4) | (((int32_t)samplePtr[0x11] & 0xC0) >> 4) >> 2;
+	  		          accel[0] = (accel_x << 12) >> 12;
+
+	  		          int32_t accel_y = ((int32_t)samplePtr[0x03] << 12) | ((int32_t)samplePtr[0x04] << 4) | (((int32_t)samplePtr[0x12] & 0xC0) >> 4) >> 2;
+	  		          accel[1] = (accel_y << 12) >> 12;
+
+	  		          int32_t accel_z = ((int32_t)samplePtr[0x05] << 12) | ((int32_t)samplePtr[0x06] << 4) | (((int32_t)samplePtr[0x13] & 0xC0) >> 4) >> 2;
+	  		          accel[2] = (accel_z << 12) >> 12;
+
+
+	  		          for (size_t i = 0; i < 3; i++) {
+	  		              accel[i] = accel[i] / 8192.0f * 9.81; ///2?
+	  		          }
+
+	  		          // sqrt(x^2 + y^2 + z^2)
+	  		          accel[3] = sqrt(accel[0]*accel[0] + accel[1]*accel[1] + accel[2]*accel[2]);
+
+	  		          // --- Gyro ---
+	  		          int32_t gyro_x = ((int32_t)samplePtr[0x07] << 12) | ((int32_t)samplePtr[0x08] << 4) | ((int32_t)samplePtr[0x11] & 0x0E) >> 1;
+	  		          gyro[0] = (gyro_x << 12) >> 12;
+	  		          int32_t gyro_y = ((int32_t)samplePtr[0x09] << 12) | ((int32_t)samplePtr[0x0A] << 4) | ((int32_t)samplePtr[0x12] & 0x0E) >> 1;
+	  		          gyro[1] = (gyro_y << 12) >> 12;
+	  		          int32_t gyro_z = ((int32_t)samplePtr[0x0B] << 12) | ((int32_t)samplePtr[0x0C] << 4) | ((int32_t)samplePtr[0x13] & 0x0E) >> 1;
+	  		          gyro[2] = (gyro_z << 12) >> 12;
+
+	  		          for (size_t i = 0; i < 3; i++) {
+	  		              gyro[i] = lowPassFilter((float)gyro[i] / 131.0f, i);
+	  		          }
+
+	  		          // --- Temp ---
+	  		          int16_t fifo_temp_data = ((int16_t)samplePtr[0x0D] << 8) | samplePtr[0x0E];
+	  		          float temperature = fifo_temp_data / 2.07f + 25;
+	  	  }
+
+
 
 	      // Convert to physical units
 	  	  // ENU
